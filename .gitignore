@@ -1,0 +1,9 @@
+__pycache__/
+*.pyc
+.venv/
+venv/
+
+# Never commit a real site configuration. Only config.example.yaml is tracked.
+config.yaml
+secrets.yaml
+*.local.yaml
