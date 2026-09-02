@@ -1,28 +1,31 @@
 # Fidelix FX-2020 to Home Assistant
 
-Controls the heating in a house: 24 rooms, each held at its own setpoint, with the
-heating shifted into the cheaper hours of the Nord Pool spot price. Any room can be
-switched to manual, or back to a plain thermostat, at any time.
+Controls the heating in a house: 24 zones, each with its own temperature sensor and
+setpoint, with the heating shifted into the cheaper hours of the Nord Pool spot price.
+Any zone can be switched to manual, or back to a plain thermostat, at any time.
 
 Underneath it is a **Modbus RTU bridge** between a Fidelix FX-2020 building automation
-controller and **Home Assistant**. It reads 24 room temperature sensors off three
-analogue cards, drives 24 heating circuits plus auxiliary outputs across five digital
+controller and **Home Assistant**. It reads the 24 zone temperature sensors off three
+analogue cards, drives the 24 heating outputs plus auxiliary outputs across the digital
 output cards, and runs unattended in an occupied house.
+
+A zone is one heating circuit with its own temperature sensor and setpoint. Zones do not
+map one-to-one onto rooms.
 
 This repository is that code with the building removed. It is **not a library and not a
 deployable package** - it is what was actually built, published so the engineering can be
 read.
 
-## Four modes, chosen per room
+## Four modes, chosen per zone
 
-Each room picks which controller drives its heating. The choice is the single source of
+Each zone picks which controller drives its heating. The choice is the single source of
 truth, so nothing overrides anything and a switch you set stays where you set it.
 
 | Mode | What it does |
 |---|---|
-| **Price optimised** | Holds the room at its setpoint but chooses when to spend the energy, biasing the heating toward the cheaper hours of the day's Nord Pool prices. Closed-loop on temperature, so a room is never left cold to chase a cheap hour. |
+| **Price optimised** | Holds the zone at its setpoint but chooses when to spend the energy, biasing the heating toward the cheaper hours of the day's Nord Pool prices. Closed-loop on temperature, so a zone is never left cold to chase a cheap hour. |
 | **Thermostat** | A plain setpoint thermostat that ignores price. The layer everything else sits on top of. |
-| **Manual** | The room's heating does what you set it to and stays there. |
+| **Manual** | The zone's heating does what you set it to and stays there. |
 | **Solar** | Runs on solar surplus, with a configurable allowance for how much grid import is acceptable. |
 
 ## The code
