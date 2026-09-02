@@ -1,16 +1,21 @@
 # Fidelix FX-2020 to Home Assistant
 
-Controls the heating in a house: 24 zones, each with its own temperature sensor and
-setpoint, with the heating shifted into the cheaper hours of the Nord Pool spot price.
-Any zone can be switched to manual, or back to a plain thermostat, at any time.
+The building's original control computer, a Windows CE machine, had failed. This is its
+replacement, built from scratch: a Raspberry Pi running Home Assistant, with the whole
+control layer written as AppDaemon apps in Python, driving the building's existing Fidelix
+FX-2020 controller over Modbus RTU.
 
-Underneath it is a **Modbus RTU bridge** between a Fidelix FX-2020 building automation
-controller and **Home Assistant**. It reads the 24 zone temperature sensors off three
-analogue cards, drives the 24 heating outputs plus auxiliary outputs across the digital
-output cards, and runs unattended in an occupied house.
+It controls 24 heating zones, each with its own temperature sensor and setpoint, and shifts
+the heating into the cheaper hours of the Nord Pool spot price. Any zone can be switched to
+manual, or back to a plain thermostat, at any time. It runs unattended in an occupied house.
 
 A zone is one heating circuit with its own temperature sensor and setpoint. Zones do not
 map one-to-one onto rooms.
+
+Talking to the FX-2020 means Modbus RTU on a serial line: raw registers, resistive sensor
+curves read through an NTC table, and output cards shared with equipment that must not be
+disturbed. Fidelix has essentially no open-source Home Assistant support, so the protocol
+work is written up in `docs/`.
 
 This repository is that code with the building removed. It is **not a library and not a
 deployable package** - it is what was actually built, published so the engineering can be
@@ -66,8 +71,7 @@ Longer notes on specific problems from building this, in `docs/`:
 - [When software can open a door](docs/03-when-software-can-open-a-door.md)
 - [A scheduler is not a thermostat](docs/04-a-scheduler-is-not-a-thermostat.md)
 - [Fidelix over Modbus RTU: field notes](docs/protocol-notes.md) - register layouts, the
-  resistive-input formula and the 16-point input cards. Fidelix has essentially no
-  open-source Home Assistant support, so none of this is documented elsewhere.
+  resistive-input formula and the 16-point input cards.
 
 ## Running the tests
 
