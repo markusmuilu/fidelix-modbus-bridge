@@ -1,13 +1,18 @@
 # Fidelix FX-2020 to Home Assistant
 
-The building's original control computer, a Windows CE machine, had failed. This is its
-replacement, built from scratch: a Raspberry Pi running Home Assistant, with the whole
-control layer written as AppDaemon apps in Python, driving the building's existing Fidelix
-FX-2020 controller over Modbus RTU.
+The building's original control computer, a Windows CE machine, had failed, and with it
+per-circuit control of the heating. What was left was a single thermostat on the wall for
+the whole house, which in a house this size is not enough to keep rooms warm. They were
+cold.
 
-It controls 24 heating zones, each with its own temperature sensor and setpoint, and shifts
-the heating into the cheaper hours of the Nord Pool spot price. Any zone can be switched to
-manual, or back to a plain thermostat, at any time. It runs unattended in an occupied house.
+This is its replacement, built from scratch: a Raspberry Pi running Home Assistant, with the
+whole control layer written as AppDaemon apps in Python, driving the building's existing
+Fidelix FX-2020 controller over Modbus RTU.
+
+It restored independent control of all 24 heating zones, each with its own temperature sensor
+and setpoint, and shifts the heating into the cheaper hours of the Nord Pool spot price. Any
+zone can be switched to manual, or back to a plain thermostat, at any time. It runs unattended
+in an occupied house.
 
 A zone is one heating circuit with its own temperature sensor and setpoint. Zones do not
 map one-to-one onto rooms.
