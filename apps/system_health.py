@@ -21,7 +21,7 @@ on a dashboard.
 Read-only apart from persistent notifications.
 """
 import appdaemon.plugins.hass.hassapi as hass
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 
 CHECK_INTERVAL = 60
 
@@ -32,6 +32,9 @@ CHECK_INTERVAL = 60
 # minutes means roughly ten missed polls in a row.
 WATCHED = {
     "sensor.modbus_last_read": ("Modbus bus read", timedelta(minutes=5)),
+    # Read-back of the DO registers, every minute. Stale means outputs are no
+    # longer being checked against HA - see modbus_bridge VERIFY_SECONDS.
+    "sensor.modbus_output_check": ("Output read-back", timedelta(minutes=5)),
     "sensor.spot_prices": ("Spot prices", timedelta(hours=6)),
     "sensor.pv_production": ("PV production", timedelta(minutes=30)),
     "sensor.grid_power": ("Grid meter", timedelta(minutes=15)),
@@ -39,7 +42,24 @@ WATCHED = {
 
 # Sources that are allowed to be missing entirely without it being a fault -
 # nothing here is load-bearing for heating, and not every install has them.
+# "Missing" means the entity does not exist. One that exists and reads
+# unavailable is a fault like any other: an integration can stop retrying after
+# its device reboots, and for days it showed as "not in use" instead of a
+# problem.
 OPTIONAL = {"sensor.pv_production", "sensor.grid_power"}
+
+# Unavailable for longer than its WATCHED limit -> reload its integration, at
+# most once per SELF_HEAL_EVERY. A reload is what fixed the grid meter
+# integration once; it touches nothing but that integration.
+SELF_HEAL = {"sensor.grid_power", "sensor.pv_production"}
+
+# Sources that are legitimately unavailable in the dark: the inverter sleeps
+# from dusk to dawn and its entity goes unavailable every night. In daylight
+# the same state is a fault - the integration once silently lost the inverter
+# for weeks and nothing said so.
+DARK_OK = {"sensor.pv_production"}
+DARK_BELOW_ELEVATION = 3.0
+SELF_HEAL_EVERY = timedelta(hours=1)
 
 STATUS_SENSOR = "sensor.jarjestelman_tila"
 NOTIFICATION_ID = "home_heating_health"
@@ -54,6 +74,7 @@ class SystemHealth(hass.Hass):
     def initialize(self):
         self.log("=== SystemHealth started ===")
         self._notified = False
+        self._last_heal = {}
         self.run_every(self.check, self.datetime(), CHECK_INTERVAL)
 
     # --------------------------------------------------
@@ -67,7 +88,9 @@ class SystemHealth(hass.Hass):
         if info.get("state") in ("unknown", "unavailable"):
             return None
 
-        stamp = info.get("last_updated") or info.get("last_changed")
+        return self._seconds_since(info.get("last_updated") or info.get("last_changed"))
+
+    def _seconds_since(self, stamp):
         if not stamp:
             return None
 
@@ -77,15 +100,19 @@ class SystemHealth(hass.Hass):
         except ValueError:
             return None
 
-        now = self.datetime()
-        # AppDaemon hands back naive local times; HA's stamps carry a timezone.
-        # Compare like with like rather than crashing on the mismatch.
-        if stamp.tzinfo is not None and now.tzinfo is None:
-            stamp = stamp.replace(tzinfo=None)
-        elif stamp.tzinfo is None and now.tzinfo is not None:
-            stamp = stamp.replace(tzinfo=now.tzinfo)
+        # HA's stamps are UTC and carry their offset; compare them with a UTC
+        # clock. Stripping the offset and comparing with AppDaemon's naive
+        # local time, as this used to, added AppDaemon's UTC offset to every
+        # age: two hours under a wrong timezone setting, so the 5-minute Modbus
+        # and 30-minute inverter limits were always exceeded and the status
+        # read vika permanently.
+        if stamp.tzinfo is not None:
+            return (self._utc_now() - stamp).total_seconds()
 
-        return (now - stamp).total_seconds()
+        return (self.datetime() - stamp).total_seconds()
+
+    def _utc_now(self):
+        return datetime.now(timezone.utc)
 
     # --------------------------------------------------
 
@@ -113,6 +140,24 @@ class SystemHealth(hass.Hass):
                 dead.append(entity)
         return sorted(dead)
 
+    def _sun_down(self):
+        elevation = self.get_state("sun.sun", attribute="elevation")
+        return isinstance(elevation, (int, float)) and elevation < DARK_BELOW_ELEVATION
+
+    def _self_heal(self, entity, label):
+        if entity not in SELF_HEAL:
+            return
+        now = self.datetime()
+        last = self._last_heal.get(entity)
+        if last is not None and now - last < SELF_HEAL_EVERY:
+            return
+        self._last_heal[entity] = now
+        self.log(f"[HEALTH] {label} unavailable - reloading its integration", level="WARNING")
+        try:
+            self.call_service("homeassistant/reload_config_entry", entity_id=entity)
+        except Exception as e:
+            self.log(f"[HEALTH] reload of {entity} failed: {e}", level="WARNING")
+
     def check(self, kwargs):
         problems = []
         details = {}
@@ -127,6 +172,19 @@ class SystemHealth(hass.Hass):
             )
 
         for entity, (label, max_age) in WATCHED.items():
+            info = self.get_state(entity, attribute="all")
+            if isinstance(info, dict) and info.get("state") in ("unavailable", "unknown"):
+                if entity in DARK_OK and self._sun_down():
+                    details[label] = "night"
+                    continue
+                down = self._seconds_since(info.get("last_changed"))
+                minutes = (down or 0) / 60.0
+                details[label] = f"unavailable {minutes:.0f} min"
+                if down is None or down > max_age.total_seconds():
+                    problems.append(f"{label}: unavailable {minutes:.0f} min")
+                    self._self_heal(entity, label)
+                continue
+
             age = self._age_of(entity)
 
             if age is None:
@@ -139,6 +197,12 @@ class SystemHealth(hass.Hass):
 
             minutes = age / 60.0
             stale = age > max_age.total_seconds()
+            # At dusk and dawn the inverter is awake but reports a constant 0 W, and a
+            # value that doesn't change doesn't refresh its timestamp. Not a fault while
+            # the sun is this low.
+            if stale and entity in DARK_OK and self._sun_down():
+                details[label] = f"{minutes:.0f} min ago (sun low)"
+                continue
             details[label] = f"{minutes:.0f} min ago" + (" - STALE" if stale else "")
 
             if stale:

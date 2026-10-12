@@ -8,7 +8,7 @@ cheap, coast when dear).
 Run: python tests/test_heating_smart.py
 """
 import sys, types, pathlib, time
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 
 APP = pathlib.Path(__file__).resolve().parent.parent / "apps"
 
@@ -55,6 +55,12 @@ class FakeApp(hs.HeatingSmart):
 
         self._ranks = ranks if ranks is not None else {}
         self._forced_rank = None
+        self._over = {p: 0 for p in hs.PHASE_SENSORS}
+        self._solar_rooms = set()
+        self._import_cycles = 0
+        self._pv_wh = {}
+        self._fc_kw = {}
+        self._distrust = None
         self.logs = []
         self.services = []
         self.published = {}
@@ -63,7 +69,37 @@ class FakeApp(hs.HeatingSmart):
         self.logs.append((level, msg))
 
     def get_state(self, entity, attribute=None, **kw):
+        if attribute == "last_updated":
+            return self.states.get(entity + "@updated")
         return self.states.get(entity)
+
+    def set_grid(self, grid_w, pv_w=2000, age_s=10):
+        stamp = (datetime.now(timezone.utc) - timedelta(seconds=age_s)).isoformat()
+        for e, v in ((hs.GRID_SENSOR, grid_w), (hs.PV_SENSOR, pv_w)):
+            self.states[e] = None if v is None else str(v)
+            self.states[e + "@updated"] = stamp
+
+    def set_plan(self, use_kw_by_hours_ahead, pv_kw_by_hours_ahead=None, issued_h_ago=0):
+        hour = datetime.now(timezone.utc).replace(minute=0, second=0, microsecond=0)
+        key = lambda a: (hour + timedelta(hours=a)).isoformat()
+        self.states[hs.SOLAR_PLAN] = {"attributes": {
+            "issued_utc": (hour - timedelta(hours=issued_h_ago)).isoformat(),
+            "use_surplus_kw_utc": {key(a): kw for a, kw in use_kw_by_hours_ahead.items()},
+            "pv_kw_utc": {key(a): kw for a, kw in (pv_kw_by_hours_ahead or use_kw_by_hours_ahead).items()},
+        }}
+
+    def set_p1(self, l1, l2, l3, age_s=10):
+        stamp = (datetime.now(timezone.utc) - timedelta(seconds=age_s)).isoformat()
+        for phase, w in zip((1, 2, 3), (l1, l2, l3)):
+            self.states[hs.PHASE_SENSORS[phase]] = str(w)
+            self.states[hs.PHASE_SENSORS[phase] + "@updated"] = stamp
+
+    def optimise(self, room, temp, target=21.0, relay="off"):
+        cfg = LOOPS[room]
+        self.states[hm.select_of(room)] = hm.OPTIMIZER
+        self.states[cfg["temp"]] = str(temp)
+        self.states[cfg["setpoint"]] = str(target)
+        self.states[cfg["relay"]] = relay
 
     def set_state(self, entity, state=None, attributes=None):
         self.published[entity] = {"state": state, "attributes": attributes or {}}
@@ -222,7 +258,7 @@ print("\n=== The target sensor exists in every mode ===")
 # Regression: it used to be published only for rooms the optimiser drove. With
 # 23 of 24 rooms on Manual that left 23 dashboard cards reading
 # "Entiteettia ei loytynyt", which looks like a broken system rather than an
-# idle one. Found 2026-08-02 from a screenshot, not from a test.
+# idle one. Found from a screenshot, not from a test.
 
 print("\n18. Every room publishes a tavoite sensor, whatever its mode")
 app = FakeApp(mode=hm.MANUAL)
@@ -253,6 +289,245 @@ app._forced_rank = 0.0
 app.control(None)
 check("state", app.published[f"sensor.{ROOM}_target"]["state"], "unknown")
 check("relay untouched", [s for s in app.services if s[1] == CFG["relay"]], [])
+
+print("\n=== Per-phase cap ===")
+# L1 zones: zone_06 2138 W measured (2352 booked), zone_16 1468 estimate
+# (1835 booked), zone_24 1015 measured (1117 booked).
+ON = lambda app, r: app.states[LOOPS[r]["relay"]] == "on"
+
+print("\n23. Room fits on its phase -> switches on")
+app = FakeApp(mode=hm.MANUAL); app._forced_rank = 0.5
+app.set_p1(1000, 500, 500)
+app.optimise("zone_06", 19.0)
+app.control(None)
+check("zone_06 on", ON(app, "zone_06"), True)
+
+print("\n24. Phase full -> waits, and says why")
+app = FakeApp(mode=hm.MANUAL); app._forced_rank = 0.5
+app.set_p1(3000, 500, 500)                      # 3000 + 2352 > 5000
+app.optimise("zone_06", 19.0)
+app.control(None)
+check("held off", ON(app, "zone_06"), False)
+check("reason names L1",
+      "L1" in app.published["sensor.zone_06_target"]["attributes"]["reason"], True)
+
+print("\n25. Coldest room first; the next one that fits still goes")
+app = FakeApp(mode=hm.MANUAL); app._forced_rank = 0.5
+app.set_p1(1500, 500, 500)                      # 3500 W free on L1
+app.optimise("zone_16", 17.0)                 # deficit 4.0, books 1835
+app.optimise("zone_06", 19.5)            # deficit 1.5, books 2352
+app.optimise("zone_24", 20.0)           # deficit 1.0, books 1117
+app.control(None)
+check("zone_16 on", ON(app, "zone_16"), True)
+check("zone_06 waits", ON(app, "zone_06"), False)
+check("zone_24 fits after it", ON(app, "zone_24"), True)
+
+print("\n26. Other phases are not affected by a full L1")
+app = FakeApp(mode=hm.MANUAL); app._forced_rank = 0.5
+app.set_p1(4900, 500, 500)
+app.optimise("zone_06", 19.0)
+app.optimise("zone_07", 19.0)           # L2
+app.control(None)
+check("L1 room waits", ON(app, "zone_06"), False)
+check("L2 room on", ON(app, "zone_07"), True)
+
+print("\n27. meter missing -> one start per cycle")
+app = FakeApp(mode=hm.MANUAL); app._forced_rank = 0.5
+for r in ("zone_06", "zone_07", "zone_05"):
+    app.optimise(r, 18.0)
+app.control(None)
+check("one room started", sum(ON(app, r) for r in ("zone_06", "zone_07", "zone_05")), 1)
+
+print("\n28. Stale meter counts as missing")
+app = FakeApp(mode=hm.MANUAL); app._forced_rank = 0.5
+app.set_p1(0, 0, 0, age_s=600)
+for r in ("zone_06", "zone_07"):
+    app.optimise(r, 18.0)
+app.control(None)
+check("one room started", sum(ON(app, r) for r in ("zone_06", "zone_07")), 1)
+
+print("\n29. Unknown element needs room on every phase")
+app = FakeApp(mode=hm.MANUAL); app._forced_rank = 0.5
+app.set_p1(500, 4000, 500)
+app.optimise("zone_22", 18.0)
+app.control(None)
+check("held while L2 is busy", ON(app, "zone_22"), False)
+app.set_p1(500, 500, 500)
+app.control(None)
+check("on when all phases have room", ON(app, "zone_22"), True)
+
+print("\n30. Over the fuse figure two cycles -> shed the room nearest its aim")
+app = FakeApp(mode=hm.MANUAL); app._forced_rank = 0.5
+app.optimise("zone_06", 20.9, relay="on")    # inside deadband, keeps heating
+app.optimise("zone_24", 20.8, relay="on")
+app.optimise("zone_02", 20.9, relay="on")      # L3, must be left alone
+app.set_p1(6200, 500, 500)
+app.control(None)
+check("nothing shed after one cycle", ON(app, "zone_06") and ON(app, "zone_24"), True)
+app.control(None)
+check("warmest L1 room shed", ON(app, "zone_06"), False)
+check("colder L1 room kept", ON(app, "zone_24"), True)
+check("L3 room untouched", ON(app, "zone_02"), True)
+
+print("\n31. Manual rooms are never shed")
+app = FakeApp(mode=hm.MANUAL); app._forced_rank = 0.5
+app.states[LOOPS["zone_06"]["relay"]] = "on"
+app.set_p1(6200, 500, 500)
+app.control(None); app.control(None)
+check("manual relay left on", ON(app, "zone_06"), True)
+
+print("\n32. Every room with a known element has a phase 1-3")
+bad = [r for r in LOOPS if hs.element_of(r) and hs.element_of(r)["phase"] not in (1, 2, 3)]
+check("bad phases", bad, [])
+
+print("\n=== Solar ===")
+# zone_02: 1050 W label, L3. Target 21, flex 1 -> top 22.
+
+print("\n33. Exporting enough -> a room inside its band heats toward the top")
+app = FakeApp(mode=hm.MANUAL); app._forced_rank = 0.5          # aim 21.0
+app.set_p1(500, 500, 0); app.set_grid(-1500)
+app.optimise("zone_02", 21.2)
+app.control(None)
+check("on for solar", ON(app, "zone_02"), True)
+check("marked solar room", "zone_02" in app._solar_rooms, True)
+check("status says heating on sun",
+      app.published[hs.SOLAR_STATUS]["state"], "heating on solar surplus")
+
+print("\n34. Export too small for the element -> stays off")
+app = FakeApp(mode=hm.MANUAL); app._forced_rank = 0.5
+app.set_p1(500, 500, 0); app.set_grid(-600)                    # 600 + 200 < 1050
+app.optimise("zone_02", 21.2)
+app.control(None)
+check("off", ON(app, "zone_02"), False)
+
+print("\n35. Export budget is shared: second room waits")
+app = FakeApp(mode=hm.MANUAL); app._forced_rank = 0.5
+app.set_p1(500, 500, 0); app.set_grid(-1500)
+app.optimise("zone_02", 21.0)                             # 1050 W
+app.optimise("zone_05", 21.2)                             # 1200 W
+app.control(None)
+check("coldest-in-band on", ON(app, "zone_02"), True)
+check("other waits", ON(app, "zone_05"), False)
+
+print("\n36. Solar room keeps heating above its normal aim while exporting")
+app = FakeApp(mode=hm.MANUAL); app._forced_rank = 0.5
+app.set_p1(500, 500, 1100); app.set_grid(-300)
+app.optimise("zone_02", 21.6, relay="on")
+app._solar_rooms.add("zone_02")
+app.control(None)
+check("still on", ON(app, "zone_02"), True)
+
+print("\n37. Stops at the top of the band")
+app.optimise("zone_02", 22.05, relay="on")
+app.control(None)
+check("off at top", ON(app, "zone_02"), False)
+
+print("\n38. Cloud: importing two cycles -> solar room off; one cycle is not enough")
+app = FakeApp(mode=hm.MANUAL); app._forced_rank = 0.5
+app.set_p1(500, 500, 1100)
+app.optimise("zone_02", 21.4, relay="on")
+app._solar_rooms.add("zone_02")
+app.set_grid(900, pv_w=400)
+app.control(None)
+check("kept after one cycle", ON(app, "zone_02"), True)
+app.control(None)
+check("off after two", ON(app, "zone_02"), False)
+
+print("\n39. Sun gone (PV under 300 W) -> no longer a solar room, back to normal aim")
+app = FakeApp(mode=hm.MANUAL); app._forced_rank = 0.5
+app.set_p1(500, 500, 1100); app.set_grid(-100, pv_w=100)
+app.optimise("zone_02", 21.6, relay="on")
+app._solar_rooms.add("zone_02")
+app.control(None)
+check("off", ON(app, "zone_02"), False)
+
+print("\n40. Grid meter missing -> no solar starts")
+app = FakeApp(mode=hm.MANUAL); app._forced_rank = 0.5
+app.set_p1(500, 500, 0); app.set_grid(-1500, age_s=600)
+app.optimise("zone_02", 21.2)
+app.control(None)
+check("off", ON(app, "zone_02"), False)
+
+print("\n41. A room below its normal aim still heats on grid, sun or no sun")
+app = FakeApp(mode=hm.MANUAL); app._forced_rank = 0.5
+app.set_p1(500, 500, 0); app.set_grid(2000, pv_w=0)
+app.optimise("zone_02", 20.0)
+app.control(None)
+check("on", ON(app, "zone_02"), True)
+check("not a solar room", "zone_02" in app._solar_rooms, False)
+
+print("\n42. Holdback: surplus coming -> cheap-hour aim capped at target")
+app = FakeApp(mode=hm.MANUAL); app._forced_rank = 0.0          # cheap: aim would be 22
+app.set_p1(500, 500, 0); app.set_grid(1000, pv_w=0)
+app.set_plan({2: 1.0, 3: 1.5})
+app.optimise("zone_02", 21.2)
+app.control(None)
+approx("aim", app.published["sensor.zone_02_target"]["state"], 21.0)
+check("no grid preheat", ON(app, "zone_02"), False)
+check("says why", "sun expected" in
+      app.published["sensor.zone_02_target"]["attributes"]["reason"], True)
+
+print("\n43. Holdback never touches the floor")
+app.optimise("zone_02", 19.5)
+app._forced_rank = 1.0                                         # aim 20.0
+app.control(None)
+check("heats below floor", ON(app, "zone_02"), True)
+
+print("\n44. Too little surplus ahead -> no holdback")
+app = FakeApp(mode=hm.MANUAL); app._forced_rank = 0.0
+app.set_p1(500, 500, 0); app.set_grid(1000, pv_w=0)
+app.set_plan({2: 0.5, 9: 3.0})                                 # 9 h is outside the window
+app.optimise("zone_02", 21.2)
+app.control(None)
+check("preheats on cheap grid", ON(app, "zone_02"), True)
+
+print("\n45. Stale forecast -> ignored")
+app = FakeApp(mode=hm.MANUAL); app._forced_rank = 0.0
+app.set_p1(500, 500, 0); app.set_grid(1000, pv_w=0)
+app.set_plan({1: 3.0}, issued_h_ago=5)
+app.optimise("zone_02", 21.2)
+app.control(None)
+check("preheats", ON(app, "zone_02"), True)
+
+print("\n46. Garbage forecast -> ignored, no crash")
+app = FakeApp(mode=hm.MANUAL); app._forced_rank = 0.0
+app.set_p1(500, 500, 0); app.set_grid(1000, pv_w=0)
+app.states[hs.SOLAR_PLAN] = {"attributes": {"issued_utc": "yesterday", "pv_kw_utc": 5}}
+app.optimise("zone_02", 21.2)
+app.control(None)
+check("preheats", ON(app, "zone_02"), True)
+
+print("\n47. Forecast far above production over completed hours -> distrusted, holdback off")
+app = FakeApp(mode=hm.MANUAL); app._forced_rank = 0.0
+app.set_p1(500, 500, 0); app.set_grid(1000, pv_w=100)
+hour = datetime.now(timezone.utc).replace(minute=0, second=0, microsecond=0)
+for back in (1, 2):
+    h = hour - timedelta(hours=back)
+    app._fc_kw[h] = 1.5                                        # promised 3 kWh
+    app._pv_wh[h] = [300.0, 60]                                # got 0.6
+app.set_plan({1: 2.0, 2: 2.0})
+app.optimise("zone_02", 21.2)
+app.control(None)
+check("distrusted", app._distrust is not None, True)
+check("preheats anyway", ON(app, "zone_02"), True)
+check("status shows it",
+      app.published[hs.SOLAR_STATUS]["attributes"]["forecast_distrusted"] is not None, True)
+
+print("\n48. Forecast close to production -> trusted")
+app = FakeApp(mode=hm.MANUAL); app._forced_rank = 0.0
+app.set_p1(500, 500, 0); app.set_grid(1000, pv_w=100)
+for back in (1, 2):
+    h = hour - timedelta(hours=back)
+    app._fc_kw[h] = 1.5
+    app._pv_wh[h] = [1300.0, 60]
+app.set_plan({1: 2.0})
+app.control(None)
+check("trusted", app._distrust, None)
+
+print("\n49. Distrust ends with the day")
+app._distrust = (datetime.now().date() - timedelta(days=1), "old")
+app.control(None)
+check("cleared", app._distrust, None)
 
 print("\n" + ("ALL PASS" if not failures else f"{len(failures)} FAILURE(S): {failures}"))
 sys.exit(1 if failures else 0)

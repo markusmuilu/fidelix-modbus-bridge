@@ -33,7 +33,7 @@ truth, so nothing overrides anything and a switch you set stays where you set it
 
 | Mode | What it does |
 |---|---|
-| **Price optimised** | Holds the zone at its setpoint but chooses when to spend the energy, biasing the heating toward the cheaper hours of the day's Nord Pool prices. Closed-loop on temperature, so a zone is never left cold to chase a cheap hour. |
+| **Price optimised** | Holds the zone at its setpoint but chooses when to spend the energy, biasing the heating toward the cheaper hours of the day's Nord Pool prices. Closed-loop on temperature, so a zone is never left cold to chase a cheap hour. Two things sit on top: a per-phase power cap, so one cheap hour cannot switch every element on at once, and live solar surplus, which lets a zone heat to the top of its band while the house exports. |
 | **Thermostat** | A plain setpoint thermostat that ignores price. The layer everything else sits on top of. |
 | **Manual** | The zone's heating does what you set it to and stays there. |
 | **Solar** | Runs on solar surplus, with a configurable allowance for how much grid import is acceptable. |
@@ -48,7 +48,8 @@ apps/
   heating_rooms.py           the zone map, in one place
   heating_mode.py            which controller owns which output
   heating_from_maps.py       the plain thermostat
-  heating_smart.py           closed-loop, price-biased thermostat
+  heating_smart.py           closed-loop, price-biased thermostat, per-phase cap,
+                             solar surplus
   heating_price_optimizer.py the open-loop version it replaced, kept unregistered
   system_health.py           the watchdog
 tests/                       offline harnesses, no hardware required
@@ -65,7 +66,9 @@ changed so the mapping matches no real cabinet.
 Not removed: the logic, the structure, and the comments. Those are as written.
 
 Also not here: the input-card point list (a door-contact and motion-detector map is a floor
-plan), the dashboards, the room map, and the solar and plant integrations.
+plan), the dashboards, the room map, and the solar and plant integrations. `heating_smart.py`
+reads a solar plan from a forecast app that is not included; the sensor name is a constant
+at the top of the file.
 
 ## Write-ups
 
@@ -75,6 +78,7 @@ Longer notes on specific problems from building this, in `docs/`:
 - [A running system is not a verified system](docs/02-a-running-system-is-not-a-verified-system.md)
 - [When software can open a door](docs/03-when-software-can-open-a-door.md)
 - [A scheduler is not a thermostat](docs/04-a-scheduler-is-not-a-thermostat.md)
+- [A write that did not land](docs/05-a-write-that-did-not-land.md)
 - [Fidelix over Modbus RTU: field notes](docs/protocol-notes.md) - register layouts, the
   resistive-input formula and the 16-point input cards.
 
@@ -86,7 +90,7 @@ for f in tests/*.py; do python3 "$f"; done
 
 No pytest, no AppDaemon, no pymodbus, no serial port: each harness stubs the platform and
 imports the real app, so the bit arithmetic and the interlock can be exercised against a
-fake register in about a second. Five suites, all passing.
+fake register in about a second. Six suites, all passing.
 
 ## Licence
 

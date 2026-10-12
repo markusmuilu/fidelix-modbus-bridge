@@ -56,6 +56,23 @@ INTER_DEVICE_DELAY = 0.05
 # its age - see the comment where it is published.
 HEARTBEAT_SENSOR = "sensor.modbus_last_read"
 
+# A FULL-REGISTER WRITE MUST NOT BE FIRE-AND-FORGET.
+#
+# A write skipped for a busy bus, or failed on the wire, used to be logged at
+# most and never repeated - and HA went on showing the new state. The hardware
+# only caught up when some other output on the same module changed and forced
+# another write. One zone's floor stayed heated for three days with its relay
+# showing off, and later sat cold with its relay showing on. A digital-input
+# probe using an unsupported function code held the bus ~5 s every 30 s, the
+# same as BUS_WAIT_SECONDS, which is the likely reason writes were skipped.
+#
+# So: a failed or skipped write is retried until it lands, and every minute
+# each full-register module is read back (the DO-8 relay register is
+# read/write per the Fidelix spec) and rewritten if it differs from HA.
+WRITE_RETRY_SECONDS = 10
+VERIFY_SECONDS = 60
+VERIFY_SENSOR = "sensor.modbus_output_check"
+
 # Temperature (C) : Resistance (ohm)
 NTC_TABLE = [
     (-50, 670100),
@@ -178,7 +195,7 @@ OUTPUT_INPUTS = {
     11: [
         "input_boolean.zone_13_heating",
         "input_boolean.zone_14_heating",
-        "input_boolean.zone_15_heating",
+        "input_boolean.zone_09_heating",
         "input_boolean.zone_12_heating",
         "input_boolean.zone_16_heating",
         "input_boolean.zone_17_heating",
@@ -193,7 +210,7 @@ OUTPUT_INPUTS = {
         "input_boolean.zone_07_heating",
         "input_boolean.zone_23_heating",
         "input_boolean.zone_24_heating",
-        "input_boolean.zone_09_heating",
+        "input_boolean.zone_15_heating",
     ],
     15: [
         "input_boolean.aux_output_1",
@@ -352,6 +369,9 @@ class ModbusAllInOne(hass.Hass):
         }
 
         self._poll_running = False
+        self._retry_pending = set()
+        self._corrections = 0
+        self._last_correction = None
 
         # Modules currently adopting hardware state into HA. Writes are suppressed
         # for these so _adopt_shared_outputs() can't loop back onto the bus.
@@ -366,6 +386,13 @@ class ModbusAllInOne(hass.Hass):
             self._poll_temperatures,
             self.datetime() + timedelta(seconds=POLL_SECONDS),
             POLL_SECONDS,
+        )
+
+        # Offset from the temperature poll so the two rarely queue on the bus.
+        self.run_every(
+            self._verify_outputs,
+            self.datetime() + timedelta(seconds=VERIFY_SECONDS + 15),
+            VERIFY_SECONDS,
         )
 
 
@@ -784,19 +811,93 @@ class ModbusAllInOne(hass.Hass):
                 self.log(f"[READ ERROR] mod={mod} {e}", level="WARNING")
                 return None
 
-    def _write_register(self, mod):
+    def _intended_value(self, mod):
         value = 0
         for bit in range(8):
             if self.bits[mod][bit]:
                 value |= (1 << bit)
+        return value
 
+    def _write_register(self, mod):
+        """Write the module's register from self.bits. True if it landed.
+
+        On any failure a retry is scheduled. The retry recomputes the value
+        from the bits at that moment, so it carries the latest intent rather
+        than replaying a stale one.
+        """
+        value = self._intended_value(mod)
         self.log(f"[WRITE] module={mod} register={OUTPUT_BASE_ADDR} value={value}")
 
         with self.bus(f"full write module {mod}") as client:
             if client is None:
-                return
-            client.write_register(
-                address=OUTPUT_BASE_ADDR,
-                value=value,
-                device_id=mod,
-            )
+                self._schedule_retry(mod, "bus busy")
+                return False
+            try:
+                rr = client.write_register(
+                    address=OUTPUT_BASE_ADDR,
+                    value=value,
+                    device_id=mod,
+                )
+            except Exception as e:
+                self._schedule_retry(mod, f"raised {e}")
+                return False
+            if rr is None or (hasattr(rr, "isError") and rr.isError()):
+                self._schedule_retry(mod, f"error response {rr}")
+                return False
+        return True
+
+    def _schedule_retry(self, mod, why):
+        self.log(f"[WRITE] module={mod} did not land ({why}); retrying in "
+                 f"{WRITE_RETRY_SECONDS}s", level="WARNING")
+        if mod in self._retry_pending:
+            return
+        self._retry_pending.add(mod)
+        self.run_in(self._retry_write, WRITE_RETRY_SECONDS, module=mod)
+
+    def _retry_write(self, kwargs):
+        mod = kwargs["module"]
+        self._retry_pending.discard(mod)
+        self._write_register(mod)
+
+    def _verify_outputs(self, kwargs):
+        """Read every full-register module back; rewrite any that drifted.
+
+        Intent is re-read from HA here rather than trusted from self.bits, so a
+        state-change callback AppDaemon missed (a reconnect, a restart race) is
+        corrected too, not only a write the bus dropped.
+        """
+        checked = 0
+        read_failures = []
+        for mod, entities in OUTPUT_INPUTS.items():
+            for bit, entity in enumerate(entities):
+                state = self.get_state(entity)
+                if state in ("on", "off"):
+                    self.bits[mod][bit] = (state == "on")
+            intended = self._intended_value(mod)
+            actual = self._read_register(mod)
+            if actual is None:
+                read_failures.append(mod)
+                continue
+            checked += 1
+            if (actual & 0xFF) != intended:
+                self._corrections += 1
+                self._last_correction = (
+                    f"{self.datetime().isoformat(timespec='seconds')} module {mod}: "
+                    f"hardware {actual & 0xFF:08b}, HA {intended:08b}"
+                )
+                self.log(f"[DRIFT] module={mod} hardware={actual & 0xFF:08b} "
+                         f"HA={intended:08b} - rewriting", level="WARNING")
+                self._write_register(mod)
+
+        if checked == 0:
+            # Nothing verified: leave the sensor stale so system_health sees it.
+            return
+        self.set_state(VERIFY_SENSOR, state=self.datetime().isoformat(timespec="seconds"),
+                       attributes={
+                           "friendly_name": "Modbus outputs verified",
+                           "icon": "mdi:check-network",
+                           "modules_checked": checked,
+                           "read_failures": read_failures,
+                           "corrections_since_start": self._corrections,
+                           "last_correction": self._last_correction,
+                       })

@@ -165,24 +165,53 @@ LOOPS = {
 
 # Element rating and phase per room, in watts.
 #
-# Four notes have listed cost-per-room as blocked on "unknown element ratings".
-# They were never unknown - they are in the relay entities' friendly names in
-# the HA UI ("Zone 01 700W L3"), which carry both the wattage and the
-# phase. Read off a screenshot of the entity list on 2026-08-03; the remaining
-# 19 need the same treatment.
+# The first five are the labels in the relay entities' friendly names in the HA
+# UI ("Zone 01 700W L3"). The rest are from an element census: one relay at a
+# time, per-phase delta from the grid meter. The census matched all five labels
+# within 8 %, same phase.
 #
-# A room absent from this map has an UNKNOWN rating, not a zero one. Nothing
-# here may default to a number: hours x watts is the only step between runtime
-# and euros, so an invented rating would produce an authoritative-looking cost
-# for a room nobody measured. Same rule as dataset_logger writing blanks rather
-# than zeros. Consumers must use element_of() and skip rooms it returns None
-# for, rather than treating this dict as complete.
+# "source" says how much to trust each number:
+#   label     - printed rating
+#   measured  - 2+ clean census readings that agree
+#   single    - one clean census reading
+#   estimate  - no clean reading; the window overlapped other loads
+#
+# A room absent from this map has an UNKNOWN rating, not a zero one. Two
+# circuits drew no power in the census (zone_22 and zone_23: local
+# thermostat, breaker or dead element?), so they are absent. Nothing here may
+# default to a number: hours x watts is the only step between runtime and euros,
+# so an invented rating would produce an authoritative-looking cost for a room
+# nobody measured. Consumers must use element_of() and handle None.
+#
+# Two zones (zone_09 and zone_15) were crossed in the original labelling; the
+# census measured them under the old names, so their two figures are swapped
+# here to follow the hardware.
+#
+# If an electrician moves a circuit to another phase, change "phase" here. The
+# per-phase cap in heating_smart reads it from nowhere else.
 ELEMENTS = {
-    "zone_01": {"watts": 700, "phase": 3},
-    "zone_02": {"watts": 1050, "phase": 3},
-    "zone_03": {"watts": 970, "phase": 1},
-    "zone_04": {"watts": 900, "phase": 1},
-    "zone_05": {"watts": 1200, "phase": 3},
+    "zone_01": {"watts": 700, "phase": 3, "source": "label"},
+    "zone_02": {"watts": 1050, "phase": 3, "source": "label"},
+    "zone_03": {"watts": 970, "phase": 1, "source": "label"},
+    "zone_04": {"watts": 900, "phase": 1, "source": "label"},
+    "zone_05": {"watts": 1200, "phase": 3, "source": "label"},
+    "zone_06": {"watts": 2138, "phase": 1, "source": "measured"},
+    "zone_07": {"watts": 1077, "phase": 2, "source": "estimate"},
+    "zone_08": {"watts": 440, "phase": 2, "source": "estimate"},
+    "zone_09": {"watts": 947, "phase": 1, "source": "estimate"},
+    "zone_10": {"watts": 444, "phase": 3, "source": "measured"},
+    "zone_11": {"watts": 867, "phase": 1, "source": "single"},
+    "zone_12": {"watts": 1520, "phase": 3, "source": "single"},
+    "zone_13": {"watts": 520, "phase": 3, "source": "measured"},
+    "zone_14": {"watts": 612, "phase": 2, "source": "measured"},
+    "zone_15": {"watts": 222, "phase": 1, "source": "single"},
+    "zone_16": {"watts": 1468, "phase": 1, "source": "estimate"},
+    "zone_17": {"watts": 609, "phase": 2, "source": "estimate"},
+    "zone_18": {"watts": 459, "phase": 3, "source": "measured"},
+    "zone_19": {"watts": 663, "phase": 2, "source": "measured"},
+    "zone_20": {"watts": 475, "phase": 2, "source": "single"},
+    "zone_21": {"watts": 253, "phase": 2, "source": "single"},
+    "zone_24": {"watts": 1015, "phase": 1, "source": "measured"},
 }
 
 
@@ -192,5 +221,10 @@ def element_of(room):
 
 
 def rated_rooms():
-    """The rooms a kWh or euro figure may legitimately be computed for."""
-    return [room for room in LOOPS if room in ELEMENTS]
+    """The rooms a kWh or euro figure may legitimately be computed for.
+
+    Estimates are good enough to keep a phase under its limit with a margin,
+    not to bill a room.
+    """
+    return [room for room in LOOPS
+            if room in ELEMENTS and ELEMENTS[room]["source"] != "estimate"]
